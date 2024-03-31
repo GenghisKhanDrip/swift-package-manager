@@ -786,24 +786,13 @@ public final class SwiftTool {
             {
                 swiftSDK = targetSwiftSDK
             } else if let swiftSDKSelector = options.build.swiftSDKSelector {
-                do {
-                    swiftSDK = try SwiftSDKBundle.selectBundle(
-                        fromBundlesAt: sharedSwiftSDKsDirectory,
-                        fileSystem: fileSystem,
-                        matching: swiftSDKSelector,
-                        hostTriple: hostTriple,
-                        observabilityScope: observabilityScope
-                    )
-                } catch {
-                    // If a user-installed bundle for the selector doesn't exist, check if the
-                    // selector is recognized as a default SDK.
-                    if let triple = try? Triple(swiftSDKSelector),
-                       let defaultSDK = SwiftSDK.defaultSwiftSDK(for: triple, hostSDK: hostSwiftSDK) {
-                        swiftSDK = defaultSDK
-                    } else {
-                        throw error
-                    }
-                }
+                let store = SwiftSDKBundleStore(
+                    swiftSDKsDirectory: self.sharedSwiftSDKsDirectory,
+                    fileSystem: self.fileSystem,
+                    observabilityScope: self.observabilityScope,
+                    outputHandler: { print($0.description) }
+                )
+                swiftSDK = try store.selectBundle(matching: swiftSDKSelector, hostTriple: hostTriple)
             } else {
                 // Otherwise use the host toolchain.
                 swiftSDK = hostSwiftSDK
