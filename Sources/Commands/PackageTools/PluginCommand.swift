@@ -47,16 +47,82 @@ struct PluginCommand: SwiftCommand {
         )
         var additionalAllowedWritableDirectories: [String] = []
 
-        enum NetworkPermission: String, EnumerableFlag, ExpressibleByArgument {
+        enum NetworkPermission: EnumerableFlag, ExpressibleByArgument {
+            static var allCases: [PluginCommand.PluginOptions.NetworkPermission] {
+                return [.none, .local(ports: []), .all(ports: []), .docker, .unixDomainSocket]
+            }
+
             case none
-            case local
-            case all
+            case local(ports: [Int])
+            case all(ports: [Int])
             case docker
             case unixDomainSocket
+
+            init?(argument: String) {
+                let arg = argument.lowercased()
+                switch arg {
+                case "none":
+                    self = .none
+                case "docker":
+                    self = .docker
+                case "unixdomainsocket":
+                    self = .unixDomainSocket
+                default:
+                    if "all" == arg.prefix(3) {
+                        let ports = Self.parsePorts(arg)
+                        self = .all(ports: ports)
+                    } else if "local" == arg.prefix(5) {
+                        let ports = Self.parsePorts(arg)
+                        self = .local(ports: ports)
+                    } else {
+                        return nil
+                    }
+                }
+            }
+
+            static func parsePorts(_ string: String) -> [Int] {
+                let parts = string.split(separator: ":")
+                guard parts.count == 2 else {
+                    return []
+                }
+                return parts[1]
+                    .split(separator: ",")
+                    .compactMap{ String($0).spm_chuzzle() }
+                    .compactMap { Int($0) }
+            }
+
+            var remedyDescription: String {
+                switch self {
+                case .none:
+                    return "none"
+                case .local(let ports):
+                    if ports.isEmpty {
+                        return "local"
+                    } else {
+                        return "local:\(ports.map(String.init).joined(separator: ","))"
+                    }
+                case .all(let ports):
+                    if ports.isEmpty {
+                        return "all"
+                    } else {
+                        return "all:\(ports.map(String.init).joined(separator: ","))"
+                    }
+                case .docker:
+                    return "docker"
+                case .unixDomainSocket:
+                    return "unixDomainSocket"
+                }
+            }
         }
 
         @Option(name: .customLong("allow-network-connections"))
         var allowNetworkConnections: NetworkPermission = .none
+
+        @Option(
+            name: .customLong("package"),
+            help: "Limit available plugins to a single package with the given identity"
+        )
+        var packageIdentity: String? = nil
     }
 
     @OptionGroup()
@@ -80,9 +146,9 @@ struct PluginCommand: SwiftCommand {
         // List the available plugins, if asked to.
         if self.listCommands {
             let packageGraph = try swiftTool.loadPackageGraph()
-            let allPlugins = PluginCommand.availableCommandPlugins(in: packageGraph)
+            let allPlugins = PluginCommand.availableCommandPlugins(in: packageGraph, limitedTo: self.pluginOptions.packageIdentity)
             for plugin in allPlugins.sorted(by: { $0.name < $1.name }) {
-                guard case .command(let intent, _) = plugin.capability else { return }
+                guard case .command(let intent, _) = plugin.capability else { continue }
                 var line = "‘\(intent.invocationVerb)’ (plugin ‘\(plugin.name)’"
                 if let package = packageGraph.packages
                     .first(where: { $0.targets.contains(where: { $0.name == plugin.name }) })
@@ -113,7 +179,7 @@ struct PluginCommand: SwiftCommand {
         let packageGraph = try swiftTool.loadPackageGraph()
 
         swiftTool.observabilityScope.emit(info: "Finding plugin for command ‘\(command)’")
-        let matchingPlugins = PluginCommand.findPlugins(matching: command, in: packageGraph)
+        let matchingPlugins = PluginCommand.findPlugins(matching: command, in: packageGraph, limitedTo: options.packageIdentity)
 
         // Complain if we didn't find exactly one.
         if matchingPlugins.isEmpty {
@@ -205,7 +271,7 @@ struct PluginCommand: SwiftCommand {
 
                     reasonString = reason
                     remedyOption =
-                        "--allow-network-connections \(PluginCommand.PluginOptions.NetworkPermission(scope).defaultValueDescription)"
+                        "--allow-network-connections \(PluginCommand.PluginOptions.NetworkPermission(scope).remedyDescription)"
                 }
 
                 let problem = "Plugin ‘\(plugin.name)’ wants permission to \(permissionString)."
@@ -275,7 +341,8 @@ struct PluginCommand: SwiftCommand {
         let delegateQueue = DispatchQueue(label: "plugin-invocation")
 
         // Run the command plugin.
-        let buildEnvironment = try swiftTool.buildParameters().buildEnvironment
+        let buildParameters = try swiftTool.buildParameters()
+        let buildEnvironment = buildParameters.buildEnvironment
         let _ = try temp_await { plugin.invoke(
             action: .performCommand(package: package, arguments: arguments),
             buildEnvironment: buildEnvironment,
@@ -288,6 +355,7 @@ struct PluginCommand: SwiftCommand {
             readOnlyDirectories: readOnlyDirectories,
             allowNetworkConnections: allowNetworkConnections,
             pkgConfigDirectories: swiftTool.options.locations.pkgConfigDirectories,
+            sdkRootPath: buildParameters.toolchain.sdkRootPath,
             fileSystem: swiftTool.fileSystem,
             observabilityScope: swiftTool.observabilityScope,
             callbackQueue: delegateQueue,
@@ -298,13 +366,23 @@ struct PluginCommand: SwiftCommand {
         // TODO: We should also emit a final line of output regarding the result.
     }
 
-    static func availableCommandPlugins(in graph: PackageGraph) -> [PluginTarget] {
-        graph.allTargets.compactMap { $0.underlyingTarget as? PluginTarget }
+    static func availableCommandPlugins(in graph: PackageGraph, limitedTo packageIdentity: String?) -> [PluginTarget] {
+        // All targets from plugin products of direct dependencies are "available".
+        let directDependencyPackages = graph.rootPackages.flatMap { $0.dependencies }.filter { $0.matching(identity: packageIdentity) }
+        let directDependencyPluginTargets = directDependencyPackages.flatMap { $0.products.filter { $0.type == .plugin } }.flatMap { $0.targets }
+        // As well as any plugin targets in root packages.
+        let rootPackageTargets = graph.rootPackages.filter { $0.matching(identity: packageIdentity) }.flatMap { $0.targets }
+        return (directDependencyPluginTargets + rootPackageTargets).compactMap { $0.underlyingTarget as? PluginTarget }.filter {
+            switch $0.capability {
+            case .buildTool: return false
+            case .command: return true
+            }
+        }
     }
 
-    static func findPlugins(matching verb: String, in graph: PackageGraph) -> [PluginTarget] {
+    static func findPlugins(matching verb: String, in graph: PackageGraph, limitedTo packageIdentity: String?) -> [PluginTarget] {
         // Find and return the command plugins that match the command.
-        Self.availableCommandPlugins(in: graph).filter {
+        Self.availableCommandPlugins(in: graph, limitedTo: packageIdentity).filter {
             // Filter out any non-command plugins and any whose verb is different.
             guard case .command(let intent, _) = $0.capability else { return false }
             return verb == intent.invocationVerb
@@ -359,8 +437,8 @@ extension PluginCommand.PluginOptions.NetworkPermission {
         case .unixDomainSocket: self = .unixDomainSocket
         case .docker: self = .docker
         case .none: self = .none
-        case .all: self = .all
-        case .local: self = .local
+        case .all(let ports): self = .all(ports: ports)
+        case .local(let ports): self = .local(ports: ports)
         }
     }
 }
@@ -369,10 +447,20 @@ extension SandboxNetworkPermission {
     init(_ permission: PluginCommand.PluginOptions.NetworkPermission) {
         switch permission {
         case .none: self = .none
-        case .local: self = .local(ports: [])
-        case .all: self = .all(ports: [])
+        case .local(let ports): self = .local(ports: ports)
+        case .all(let ports): self = .all(ports: ports)
         case .docker: self = .docker
         case .unixDomainSocket: self = .unixDomainSocket
+        }
+    }
+}
+
+extension ResolvedPackage {
+    fileprivate func matching(identity: String?) -> Bool {
+        if let identity {
+            return self.identity == .plain(identity)
+        } else {
+            return true
         }
     }
 }

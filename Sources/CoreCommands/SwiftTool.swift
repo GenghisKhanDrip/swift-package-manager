@@ -13,7 +13,6 @@
 import ArgumentParser
 import Basics
 import Dispatch
-@_implementationOnly import DriverSupport
 import class Foundation.NSLock
 import class Foundation.ProcessInfo
 import PackageGraph
@@ -21,6 +20,12 @@ import PackageLoading
 import PackageModel
 import SPMBuildCore
 import Workspace
+
+#if USE_IMPL_ONLY_IMPORTS
+@_implementationOnly import DriverSupport
+#else
+import DriverSupport
+#endif
 
 #if canImport(WinSDK)
 import WinSDK
@@ -199,16 +204,16 @@ public final class SwiftTool {
     public let scratchDirectory: AbsolutePath
 
     /// Path to the shared security directory
-    public let sharedSecurityDirectory: AbsolutePath?
+    public let sharedSecurityDirectory: AbsolutePath
 
     /// Path to the shared cache directory
-    public let sharedCacheDirectory: AbsolutePath?
+    public let sharedCacheDirectory: AbsolutePath
 
     /// Path to the shared configuration directory
-    public let sharedConfigurationDirectory: AbsolutePath?
+    public let sharedConfigurationDirectory: AbsolutePath
 
     /// Path to the cross-compilation Swift SDKs directory.
-    public let sharedSwiftSDKsDirectory: AbsolutePath?
+    public let sharedSwiftSDKsDirectory: AbsolutePath
 
     /// Cancellator to handle cancellation of outstanding work when handling SIGINT
     public let cancellator: Cancellator
@@ -247,8 +252,6 @@ public final class SwiftTool {
     private let toolWorkspaceConfiguration: ToolWorkspaceConfiguration
 
     fileprivate var buildSystemProvider: BuildSystemProvider?
-
-    private let driverSupport = DriverSupport()
 
     /// Create an instance of this tool.
     ///
@@ -428,7 +431,7 @@ public final class SwiftTool {
                     // TODO: should supportsAvailability be a flag as well?
                     .init(url: $0, supportsAvailability: true)
                 },
-                restrictImports: .none
+                manifestImportRestrictions: .none
             ),
             cancellator: self.cancellator,
             initializationWarningHandler: { self.observabilityScope.emit(warning: $0) },
@@ -664,42 +667,69 @@ public final class SwiftTool {
         return buildSystem
     }
 
+    static let entitlementsMacOSWarning = """
+    `--disable-get-task-allow-entitlement` and `--disable-get-task-allow-entitlement` only have an effect \
+    when building on macOS.
+    """
+
     private func _buildParams(toolchain: UserToolchain) throws -> BuildParameters {
+        let hostTriple = try self.getHostToolchain().targetTriple
         let targetTriple = toolchain.targetTriple
 
         let dataPath = self.scratchDirectory.appending(
             component: targetTriple.platformBuildPathComponent(buildSystem: options.build.buildSystem)
         )
 
+        if options.build.getTaskAllowEntitlement != nil && !targetTriple.isMacOSX {
+            observabilityScope.emit(warning: Self.entitlementsMacOSWarning)
+        }
+
         return try BuildParameters(
             dataPath: dataPath,
             configuration: options.build.configuration,
             toolchain: toolchain,
+            hostTriple: hostTriple,
             targetTriple: targetTriple,
             flags: options.build.buildFlags,
             pkgConfigDirectories: options.locations.pkgConfigDirectories,
             architectures: options.build.architectures,
             workers: options.build.jobs ?? UInt32(ProcessInfo.processInfo.activeProcessorCount),
-            shouldLinkStaticSwiftStdlib: options.linker.shouldLinkStaticSwiftStdlib,
-            canRenameEntrypointFunctionName: driverSupport.checkSupportedFrontendFlags(
-                flags: ["entry-point-function-name"],
-                toolchain: toolchain,
-                fileSystem: self.fileSystem
-            ),
             sanitizers: options.build.enabledSanitizers,
-            enableCodeCoverage: false, // set by test commands when appropriate
             indexStoreMode: options.build.indexStoreMode.buildParameter,
-            enableParseableModuleInterfaces: options.build.shouldEnableParseableModuleInterfaces,
-            useIntegratedSwiftDriver: options.build.useIntegratedSwiftDriver,
-            useExplicitModuleBuild: options.build.useExplicitModuleBuild,
             isXcodeBuildSystemEnabled: options.build.buildSystem == .xcode,
-            forceTestDiscovery: options.build.enableTestDiscovery, // backwards compatibility, remove with --enable-test-discovery
-            testEntryPointPath: options.build.testEntryPointPath,
-            explicitTargetDependencyImportCheckingMode: options.build.explicitTargetDependencyImportCheck.modeParameter,
-            linkerDeadStrip: options.linker.linkerDeadStrip,
-            verboseOutput: self.logLevel <= .info,
-            linkTimeOptimizationMode: options.build.linkTimeOptimizationMode?.buildParameter,
-            debugInfoFormat: options.build.debugInfoFormat.buildParameter
+            debuggingParameters: .init(
+                debugInfoFormat: options.build.debugInfoFormat.buildParameter,
+                targetTriple: targetTriple,
+                shouldEnableDebuggingEntitlement:
+                    options.build.getTaskAllowEntitlement ?? (options.build.configuration == .debug),
+                omitFramePointers: options.build.omitFramePointers
+            ),
+            driverParameters: .init(
+                canRenameEntrypointFunctionName: DriverSupport.checkSupportedFrontendFlags(
+                    flags: ["entry-point-function-name"],
+                    toolchain: toolchain,
+                    fileSystem: self.fileSystem
+                ),
+                enableParseableModuleInterfaces: options.build.shouldEnableParseableModuleInterfaces,
+                explicitTargetDependencyImportCheckingMode: options.build.explicitTargetDependencyImportCheck.modeParameter,
+                useIntegratedSwiftDriver: options.build.useIntegratedSwiftDriver,
+                useExplicitModuleBuild: options.build.useExplicitModuleBuild
+            ),
+            linkingParameters: .init(
+                linkerDeadStrip: options.linker.linkerDeadStrip,
+                linkTimeOptimizationMode: options.build.linkTimeOptimizationMode?.buildParameter,
+                shouldDisableLocalRpath: options.linker.shouldDisableLocalRpath,
+                shouldLinkStaticSwiftStdlib: options.linker.shouldLinkStaticSwiftStdlib
+            ),
+            outputParameters: .init(
+                isVerbose: self.logLevel <= .info
+            ),
+            testingParameters: .init(
+                configuration: options.build.configuration,
+                targetTriple: targetTriple,
+                forceTestDiscovery: options.build.enableTestDiscovery, // backwards compatibility, remove with --enable-test-discovery
+                testEntryPointPath: options.build.testEntryPointPath
+            )
         )
     }
 
@@ -732,14 +762,14 @@ public final class SwiftTool {
         do {
             let hostToolchain = try _hostToolchain.get()
             hostSwiftSDK = hostToolchain.swiftSDK
-            let hostTriple = try Triple.getHostTriple(usingSwiftCompiler: hostToolchain.swiftCompilerPath)
+            let hostTriple = hostToolchain.targetTriple
 
             // Create custom toolchain if present.
-            if let customDestination = options.locations.customCompileDestination {
+            if let customDestination = self.options.locations.customCompileDestination {
                 let swiftSDKs = try SwiftSDK.decode(
                     fromFile: customDestination,
-                    fileSystem: fileSystem,
-                    observabilityScope: observabilityScope
+                    fileSystem: self.fileSystem,
+                    observabilityScope: self.observabilityScope
                 )
                 if swiftSDKs.count == 1 {
                     swiftSDK = swiftSDKs[0]
@@ -786,12 +816,22 @@ public final class SwiftTool {
             swiftSDK.targetTriple = triple
         }
         if let binDir = options.build.customCompileToolchain {
+            if !self.fileSystem.exists(binDir) {
+                self.observabilityScope.emit(
+                    warning: """
+                        Toolchain directory specified through a command-line option doesn't exist and is ignored: `\(
+                            binDir
+                        )`
+                        """
+                )
+            }
+
             swiftSDK.add(toolsetRootPath: binDir.appending(components: "usr", "bin"))
         }
         if let sdk = options.build.customCompileSDK {
             swiftSDK.pathsConfiguration.sdkRootPath = sdk
         }
-        swiftSDK.architectures = options.build.architectures
+        swiftSDK.architectures = options.build.architectures.isEmpty ? nil : options.build.architectures
 
         // Check if we ended up with the host toolchain.
         if hostSwiftSDK == swiftSDK {
@@ -805,7 +845,9 @@ public final class SwiftTool {
     private lazy var _hostToolchain: Result<UserToolchain, Swift.Error> = {
         return Result(catching: {
             try UserToolchain(swiftSDK: SwiftSDK.hostSwiftSDK(
-                originalWorkingDirectory: self.originalWorkingDirectory))
+                originalWorkingDirectory: self.originalWorkingDirectory,
+                observabilityScope: self.observabilityScope
+            ))
         })
     }()
 
@@ -821,16 +863,16 @@ public final class SwiftTool {
             case (false, .local):
                 cachePath = self.scratchDirectory
             case (false, .shared):
-                cachePath = self.sharedCacheDirectory.map{ Workspace.DefaultLocations.manifestsDirectory(at: $0) }
+                cachePath = Workspace.DefaultLocations.manifestsDirectory(at: self.sharedCacheDirectory)
             }
 
             var extraManifestFlags = self.options.build.manifestFlags
             // Disable the implicit concurrency import if the compiler in use supports it to avoid warnings if we are building against an older SDK that does not contain a Concurrency module.
-            if driverSupport.checkSupportedFrontendFlags(flags: ["disable-implicit-concurrency-module-import"], toolchain: try self.buildParameters().toolchain, fileSystem: self.fileSystem) {
+            if DriverSupport.checkSupportedFrontendFlags(flags: ["disable-implicit-concurrency-module-import"], toolchain: try self.buildParameters().toolchain, fileSystem: self.fileSystem) {
                 extraManifestFlags += ["-Xfrontend", "-disable-implicit-concurrency-module-import"]
             }
             // Disable the implicit string processing import if the compiler in use supports it to avoid warnings if we are building against an older SDK that does not contain a StringProcessing module.
-            if driverSupport.checkSupportedFrontendFlags(flags: ["disable-implicit-string-processing-module-import"], toolchain: try self.buildParameters().toolchain, fileSystem: self.fileSystem) {
+            if DriverSupport.checkSupportedFrontendFlags(flags: ["disable-implicit-string-processing-module-import"], toolchain: try self.buildParameters().toolchain, fileSystem: self.fileSystem) {
                 extraManifestFlags += ["-Xfrontend", "-disable-implicit-string-processing-module-import"]
             }
 
@@ -844,7 +886,7 @@ public final class SwiftTool {
                 isManifestSandboxEnabled: !self.shouldDisableSandbox,
                 cacheDir: cachePath,
                 extraManifestFlags: extraManifestFlags,
-                restrictImports: nil
+                importRestrictions: .none
             )
         })
     }()
@@ -873,7 +915,7 @@ private func findPackageRoot(fileSystem: FileSystem) -> AbsolutePath? {
     return root
 }
 
-private func getSharedSecurityDirectory(options: GlobalOptions, fileSystem: FileSystem) throws -> AbsolutePath? {
+private func getSharedSecurityDirectory(options: GlobalOptions, fileSystem: FileSystem) throws -> AbsolutePath {
     if let explicitSecurityDirectory = options.locations.securityDirectory {
         // Create the explicit security path if necessary
         if !fileSystem.exists(explicitSecurityDirectory) {
@@ -886,7 +928,7 @@ private func getSharedSecurityDirectory(options: GlobalOptions, fileSystem: File
     }
 }
 
-private func getSharedConfigurationDirectory(options: GlobalOptions, fileSystem: FileSystem) throws -> AbsolutePath? {
+private func getSharedConfigurationDirectory(options: GlobalOptions, fileSystem: FileSystem) throws -> AbsolutePath {
     if let explicitConfigurationDirectory = options.locations.configurationDirectory {
         // Create the explicit config path if necessary
         if !fileSystem.exists(explicitConfigurationDirectory) {
@@ -899,7 +941,7 @@ private func getSharedConfigurationDirectory(options: GlobalOptions, fileSystem:
     }
 }
 
-private func getSharedCacheDirectory(options: GlobalOptions, fileSystem: FileSystem) throws -> AbsolutePath? {
+private func getSharedCacheDirectory(options: GlobalOptions, fileSystem: FileSystem) throws -> AbsolutePath {
     if let explicitCacheDirectory = options.locations.cacheDirectory {
         // Create the explicit cache path if necessary
         if !fileSystem.exists(explicitCacheDirectory) {

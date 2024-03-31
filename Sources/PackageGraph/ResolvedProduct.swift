@@ -59,6 +59,14 @@ public final class ResolvedProduct {
         self.underlyingProduct = product
         self.targets = targets
 
+        // defaultLocalization is currently shared across the entire package
+        // this may need to be enhanced if / when we support localization per target or product
+        let defaultLocalization = self.targets.first?.defaultLocalization
+        self.defaultLocalization = defaultLocalization
+
+        let platforms = Self.computePlatforms(targets: targets)
+        self.platforms = platforms
+
         self.testEntryPointTarget = underlyingProduct.testEntryPointPath.map { testEntryPointPath in
             // Create an executable resolved target with the entry point file, adding product's targets as dependencies.
             let dependencies: [Target.Dependency] = product.targets.map { .target($0, conditions: []) }
@@ -69,16 +77,10 @@ public final class ResolvedProduct {
             return ResolvedTarget(
                 target: swiftTarget,
                 dependencies: targets.map { .target($0, conditions: []) },
-                defaultLocalization: .none, // safe since this is a derived product
-                platforms: .init(declared: [], derived: []) // safe since this is a derived product
+                defaultLocalization: defaultLocalization ?? .none, // safe since this is a derived product
+                platforms: platforms
             )
         }
-
-        // defaultLocalization is currently shared across the entire package
-        // this may need to be enhanced if / when we support localization per target or product
-        self.defaultLocalization = self.targets.first?.defaultLocalization
-
-        self.platforms = Self.computePlatforms(targets: targets)
     }
 
     /// True if this product contains Swift targets.
@@ -118,16 +120,13 @@ public final class ResolvedProduct {
             merge(into: &partial, platforms: item.platforms.declared)
         }
 
-        let derived = targets.reduce(into: [SupportedPlatform]()) { partial, item in
-            merge(into: &partial, platforms: item.platforms.derived)
-        }
-
         return SupportedPlatforms(
-            declared: declared.sorted(by: { $0.platform.name < $1.platform.name }),
-            derived: derived.sorted(by: { $0.platform.name < $1.platform.name })
-        )
-
-
+            declared: declared.sorted(by: { $0.platform.name < $1.platform.name })) { declared in
+                let platforms = targets.reduce(into: [SupportedPlatform]()) { partial, item in
+                    merge(into: &partial, platforms: [item.platforms.getDerived(for: declared, usingXCTest: item.type == .test)])
+                }
+                return platforms.first!.version
+            }
     }
 }
 
@@ -144,5 +143,12 @@ extension ResolvedProduct: Hashable {
 extension ResolvedProduct: CustomStringConvertible {
     public var description: String {
         return "<ResolvedProduct: \(name)>"
+    }
+}
+
+extension ResolvedProduct {
+    public var isLinkingXCTest: Bool {
+        // To retain existing behavior, we have to check both the product type, as well as the types of all of its targets.
+        return self.type == .test || self.targets.contains(where: { $0.type == .test })
     }
 }

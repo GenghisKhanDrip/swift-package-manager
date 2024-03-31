@@ -29,7 +29,7 @@ public protocol Toolchain {
     var isSwiftDevelopmentToolchain: Bool { get }
 
     /// Path to the Swift plugin server utility.
-    var swiftPluginServerPath: AbsolutePath? { get }
+    var swiftPluginServerPath: AbsolutePath? { get throws }
 
     /// Path containing the macOS Swift stdlib.
     var macosSwiftStdlib: AbsolutePath { get throws }
@@ -39,6 +39,12 @@ public protocol Toolchain {
 
     /// An array of paths to search for libraries at link time.
     var librarySearchPaths: [AbsolutePath] { get }
+
+    /// Configuration from the used toolchain.
+    var installedSwiftPMConfiguration: InstalledSwiftPMConfiguration { get }
+
+    /// The root path to the Swift SDK used by this toolchain.
+    var sdkRootPath: AbsolutePath? { get }
 
     /// Path of the `clang` compiler.
     func getClangCompiler() throws -> AbsolutePath
